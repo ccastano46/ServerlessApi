@@ -426,6 +426,164 @@ Responsibility is also split across layers. `OrderErrorCode` stores numeric HTTP
 
 Finally, API Gateway mappings do not solve the application’s in-memory data limitation. The current implementation does not provide durable order storage or reliable sharing of newly created orders across the three separate Lambda functions.
 
+## Lambda Proxy Integration
+
+Primero vamos a investigar como llega el evento a nuesta aplicación, para eso creamos la clase
+**DebugHandler** y lo creamos una lambda para su metodo **echo**
+
+Creamos una nueva API REST con un recurso /debug y lo unimos a la lambda recien creada con proxy integration activa
+
+![Captura de pantalla 2026-10-26 a la(s) 4.39.31 p.m..png](docs/images/Captura%20de%20pantalla%202026-10-26%20a%20la%28s%29%204.39.31%E2%80%AFp.m..png)
+
+Desplegamos la API en dev stage y probamos el endpoint /debug para ver como se esta recibiendo el evento
+
+Luego de tener una respuesta 200
+
+![Captura de pantalla 2026-10-26 a la(s) 4.53.14 p.m..png](docs/images/Captura%20de%20pantalla%202026-10-26%20a%20la%28s%29%204.53.14%E2%80%AFp.m..png)
+
+vamos a Watch log para ver como esta llegando el evento que es algo similar a 
+
+```json
+{
+  "resource": "/debug",
+  "path": "/debug",
+  "httpMethod": "GET",
+  "headers": {
+    "accept": "*/*",
+    "Host": "ar8rneast-1.amazonaws.com",
+    "User-Agent": "PostmanRuntime/2.12.2",
+    "X-Forwarded-For": "186.29.255.38",
+    "X-Forwarded-Port": "443",
+    "X-Forwarded-Proto": "https"
+  },
+  "queryStringParameters": null,
+  "pathParameters": null,
+  "stageVariables": null,
+  "requestContext": {
+    "resourcePath": "/debug",
+    "httpMethod": "GET",
+    "path": "/dev/debug",
+    "stage": "dev",
+    "apiId": "ar"
+  },
+  "body": null,
+  "isBase64Encoded": false
+}
+```
+
+Ahora vamos a crear los 3 handlers (uno por metodo)
+
+Para eso necesitamos la dependencia 
+
+```xml
+<dependency>
+    <groupId>com.fasterxml.jackson.core</groupId>
+    <artifactId>jackson-databind</artifactId>
+    <version>2.17.0</version>
+</dependency>
+```
+
+La nueva arquitectura es
+
+```text
+API Gateway (proxy)
+        │
+        ▼
+        Lambda Handler (eci.arem.http.*)   ← capa HTTP, conoce JSON/status codes
+        │
+        ▼
+        OrderService (eci.arem)             ← lógica de negocio pura, Java plano
+```
+
+Una vez creado los handlers podemos crear los lambda y recursos en el API
+
+Los recursos se crean casi igual que como se hizo sin proxy integration, pero esta vez no se crean los Mapping templates,
+ni el integration response ni el method respons. Lo único que se mantiene es 
+el query parameter para get orderd by customer id.
+
+![Captura de pantalla 2026-10-26 a la(s) 5.41.54 p.m..png](docs/images/Captura%20de%20pantalla%202026-10-26%20a%20la%28s%29%205.41.54%E2%80%AFp.m..png)
+
+![Captura de pantalla 2026-10-26 a la(s) 5.43.09 p.m..png](docs/images/Captura%20de%20pantalla%202026-10-26%20a%20la%28s%29%205.43.09%E2%80%AFp.m..png)
+
+![Captura de pantalla 2026-10-26 a la(s) 5.44.18 p.m..png](docs/images/Captura%20de%20pantalla%202026-10-26%20a%20la%28s%29%205.44.18%E2%80%AFp.m..png)
+
+### Tests
+
+#### Create Order
+```text
+https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev/orders
+```
+
+```json
+{
+  "product": "MacBook Air",
+  "quantity": 1
+}
+```
+
+![createOrderProxySuccess.png](docs/images/tests/createOrderProxySuccess.png)
+Si vemos los headers vemos que esta el location con el id de la orden creada
+
+![location.png](docs/images/tests/location.png)
+
+Null
+```json
+{
+  "customerId": "CUST-42",
+  "product": "MacBook Air",
+  "quantity": 1
+}
+```
+
+![proxyCreateNull.png](docs/images/tests/proxyCreateNull.png)
+
+Negative
+
+```json
+{
+  "customerId": "CUST-42",
+  "product": "MacBook Air",
+  "quantity": -5
+}
+```
+
+![createProxyNegative.png](docs/images/tests/createProxyNegative.png)
+
+#### Get Oder By Id
+
+Not found
+
+```text
+https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev/orders/test
+```
+
+Found
+
+```text
+https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev/orders/TEST-ORDER-001
+```
+![orderIdProxyFound.png](docs/images/tests/orderIdProxyFound.png)
+
+#### Get Order By Customer Id
+
+Bad Request
+
+```text
+https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev/orders
+```
+![proxCustomerIdNull.png](docs/images/tests/proxCustomerIdNull.png)
+Success
+
+```text
+https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev/orders?customerId=CUST-03
+```
+![proxCustomerId.png](docs/images/tests/proxCustomerId.png)
+
+## Compare the Two Architectures
+
+
+
+
 
 ## References
 
