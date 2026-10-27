@@ -26,7 +26,6 @@ public class CreateOrderHandler {
         } catch (OrderException ex) {
             return HttpResponse.fromException(ex);
         } catch (com.fasterxml.jackson.databind.exc.ValueInstantiationException ex) {
-            // Jackson envuelve la OrderException lanzada en el constructor del record
             if (ex.getCause() instanceof OrderException oe) {
                 return HttpResponse.fromException(oe);
             }

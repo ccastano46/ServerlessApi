@@ -795,6 +795,39 @@ Architecture B. All behavior is expressed in Java code that a developer can read
 
 Architecture B (proxy integration). For a larger system, the ability to version-control, unit-test, and code-review the full HTTP contract is more important than reducing the amount of Java code. Mapping templates and regex-based response selection are fragile: a change to an error message in Java can silently break an API Gateway mapping with no compile-time or test-time feedback. Proxy integration moves the HTTP mapping into the same codebase and build pipeline as the business logic. The trade-off is that the Java project now contains HTTP-aware adapter code, but this adapter layer is thin, follows a repeatable pattern, and can be tested without AWS. For teams that adopt infrastructure-as-code tools such as SAM or CDK, proxy integration also simplifies the deployment template, since fewer API Gateway configuration blocks are required.
 
+## Final Challenge - Extend the API
+
+In this section, we are going to add a new operation to the API:
+
+DELETE /orders/{id}
+
+For this operation, we will need to add a neew method to `OrderService` and a new handler class.
+
+**1. Which Java classes should change?**
+
+OrderService.java will need a new method to delete an order by ID and the packet http will need a new handler class.
+
+**2. Do you need a new Lambda function?**
+
+Yes, becasue we need a lambda functio for each method.
+
+**3. Does API Gateway configuration need to change?**
+
+Just need to add a new resource that invoke the lambda function.
+
+**4. Where should the deletion logic reside?**
+
+In orderService.java.
+
+**5.Where should the decision to return 204 or 404 reside?**
+
+In HttpRespone.java.
+
+**6. Which tests should be added?**
+
+A test for the new method.
+
+
 ## References
 
 [1] [AWS Lambda: Define a Lambda function handler in Java](https://docs.aws.amazon.com/lambda/latest/dg/java-handler.html)
