@@ -65,5 +65,13 @@ public class HttpResponse {
         return response;
     }
 
+    public static Map<String, Object> noContent() {
+        Map<String, Object> response = new HashMap<>();
+        response.put("statusCode", 204);
+        response.put("headers", Map.of());
+        response.put("body", "");
+        return response;
+    }
+
 
 }

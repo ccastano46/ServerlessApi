@@ -64,4 +64,9 @@ public class OrderService {
                 .filter(order -> order.customerId().equals(customerId.trim()))
                 .toList();
     }
+
+    public static void deleteOrder(String id) {
+        Order order = getOrderById(id);
+        orders.remove(order);
+    }
 }

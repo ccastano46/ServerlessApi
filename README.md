@@ -803,6 +803,10 @@ DELETE /orders/{id}
 
 For this operation, we will need to add a neew method to `OrderService` and a new handler class.
 
+For my implementation, I am going to create a new method in the `OrderService` class  that uses
+the method getOrderById(String id) from the OrderService class, that way, it would trhow the same exception if the order
+does not exist or if it was a bad request.
+
 **1. Which Java classes should change?**
 
 OrderService.java will need a new method to delete an order by ID and the packet http will need a new handler class.
@@ -824,8 +828,35 @@ In orderService.java.
 In HttpRespone.java.
 
 **6. Which tests should be added?**
-
 A test for the new method.
+
+
+Lo que hizo la IA fue además de agregar un nuevo metodo en OrderService, añadio un helper en HttpResponse y creo la clase
+Delete order handler.
+
+Creamos un nuevo recurso en API Gateway y le asignamos el lambda function que se encarga de eliminar una orden
+
+![Captura de pantalla 2026-10-27 a la(s) 3.56.19 a.m..png](docs/images/Captura%20de%20pantalla%202026-10-27%20a%20la%28s%29%203.56.19%E2%80%AFa.m..png)
+
+Lo probamos
+
+```text
+https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev/orders/TEST-ORDER-001
+```
+![successdelete.png](docs/images/tests/successdelete.png)
+
+Inexistente
+
+```text
+https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev/orders/TEST
+```
+![DELETNOT.png](docs/images/tests/DELETNOT.png)
+
+## Required Architecture Diagram
+
+## Recap de como correr pruebas y empaquetar la app
+
+
 
 
 ## References

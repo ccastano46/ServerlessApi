@@ -280,4 +280,66 @@ class OrderServiceTest {
             assertNotEquals(first, second);
         }
     }
+
+    // =================================================================
+    // 4. Eliminación de orden
+    // =================================================================
+    @Nested
+    @DisplayName("Eliminación de orden")
+    class DeleteOrderOp {
+
+        @Test
+        @DisplayName("deleteOrder debe eliminar la orden existente")
+        void deleteOrderShouldRemoveExistingOrder() {
+            String customerId = "CUST-DEL-" + System.nanoTime();
+            Order created = OrderService.addOrder(new CreateOrder(customerId, "Laptop", 1));
+
+            OrderService.deleteOrder(created.id());
+
+            OrderException exception = assertThrows(OrderException.class,
+                    () -> OrderService.getOrderById(created.id()));
+            assertEquals(OrderErrorCode.ORDER_NOT_FOUND, exception.getErrorCode());
+        }
+
+        @Test
+        @DisplayName("deleteOrder debe lanzar ORDER_NOT_FOUND si el id no existe")
+        void deleteOrderShouldThrowWhenIdDoesNotExist() {
+            OrderException exception = assertThrows(OrderException.class,
+                    () -> OrderService.deleteOrder("ID-QUE-NO-EXISTE"));
+
+            assertEquals(OrderErrorCode.ORDER_NOT_FOUND, exception.getErrorCode());
+        }
+
+        @Test
+        @DisplayName("deleteOrder debe lanzar BLANK_NULL cuando el id es null")
+        void deleteOrderShouldThrowWhenIdIsNull() {
+            OrderException exception = assertThrows(OrderException.class,
+                    () -> OrderService.deleteOrder(null));
+
+            assertEquals(OrderErrorCode.BLANK_NULL, exception.getErrorCode());
+        }
+
+        @Test
+        @DisplayName("deleteOrder debe lanzar BLANK_NULL cuando el id está en blanco")
+        void deleteOrderShouldThrowWhenIdIsBlank() {
+            OrderException exception = assertThrows(OrderException.class,
+                    () -> OrderService.deleteOrder("   "));
+
+            assertEquals(OrderErrorCode.BLANK_NULL, exception.getErrorCode());
+        }
+
+        @Test
+        @DisplayName("deleteOrder no debe afectar otras órdenes del mismo cliente")
+        void deleteOrderShouldNotAffectOtherOrders() {
+            String customerId = "CUST-DEL-MULTI-" + System.nanoTime();
+            Order first = OrderService.addOrder(new CreateOrder(customerId, "Laptop", 1));
+            Order second = OrderService.addOrder(new CreateOrder(customerId, "Mouse", 2));
+
+            OrderService.deleteOrder(first.id());
+
+            List<Order> remaining = OrderService.getOrdersByCustomerId(customerId);
+            assertEquals(1, remaining.size());
+            assertEquals(second, remaining.get(0));
+        }
+    }
 }
