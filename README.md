@@ -12,7 +12,7 @@ The current API exposes three operations:
 - `GET /orders/{id}` retrieves one order by its identifier.
 - `GET /orders?customerId={customerId}` retrieves the orders associated with a customer.
 
-> The Java service currently keeps sample and created orders in a static, in-memory list. 
+> The Java service currently keeps sample and created orders in a static, in-memory list.
 
 ## API Design
 
@@ -76,7 +76,7 @@ The API returns `201 Created` and the created order representation, including th
 
 **5. What should the API return when an order does not exist?**
 
-`GET /orders/{id}` returns `404 Not Found` with an error body such as `{"error":"ORDER_NOT_FOUND","message":"Order not found"}`. 
+`GET /orders/{id}` returns `404 Not Found` with an error body such as `{"error":"ORDER_NOT_FOUND","message":"Order not found"}`.
 
 **6. What information should an error response contain?**
 
@@ -428,20 +428,34 @@ Finally, API Gateway mappings do not solve the application’s in-memory data li
 
 ## Lambda Proxy Integration
 
-Primero vamos a investigar como llega el evento a nuesta aplicación, para eso creamos la clase
-**DebugHandler** y lo creamos una lambda para su metodo **echo**
+The previous architecture uses API Gateway mapping templates and integration responses to transform every HTTP request into the exact JSON value expected by a plain Java method and to translate Lambda results and errors into HTTP responses. An alternative approach delegates those responsibilities to the Java application by enabling **Lambda proxy integration**. With proxy integration, API Gateway forwards the entire HTTP request as a structured JSON event to Lambda and expects the function to return a response object containing the status code, headers, and body. The Lambda handler, rather than API Gateway, owns the HTTP contract.
 
-Creamos una nueva API REST con un recurso /debug y lo unimos a la lambda recien creada con proxy integration activa
+### Investigate the proxy event
 
-![Captura de pantalla 2026-10-26 a la(s) 4.39.31 p.m..png](docs/images/Captura%20de%20pantalla%202026-10-26%20a%20la%28s%29%204.39.31%E2%80%AFp.m..png)
+Before writing the order handlers, a `DebugHandler` class was created to inspect the event that API Gateway sends when proxy integration is enabled. The handler accepts a `Map<String, Object>` event, logs it to CloudWatch, and returns a minimal `200 OK` response:
 
-Desplegamos la API en dev stage y probamos el endpoint /debug para ver como se esta recibiendo el evento
+```java
+public class DebugHandler {
+    public static Map<String, Object> echo(Map<String, Object> event) {
+        System.out.println("EVENT_DUMP: " + event);
+        return Map.of(
+                "statusCode", 200,
+                "headers", Map.of("Content-Type", "application/json"),
+                "body", "{\"ok\": true}"
+        );
+    }
+}
+```
 
-Luego de tener una respuesta 200
+A new REST API was created with a `/debug` resource pointing to this Lambda function with **Use Lambda Proxy integration** enabled:
 
-![Captura de pantalla 2026-10-26 a la(s) 4.53.14 p.m..png](docs/images/Captura%20de%20pantalla%202026-10-26%20a%20la%28s%29%204.53.14%E2%80%AFp.m..png)
+![Enable Lambda proxy integration for the debug resource](docs/images/Captura%20de%20pantalla%202026-10-26%20a%20la%28s%29%204.39.31%E2%80%AFp.m..png)
 
-vamos a Watch log para ver como esta llegando el evento que es algo similar a 
+The API was deployed to the `dev` stage, and a `GET /debug` request confirmed a `200 OK` response:
+
+![Successful 200 response from the debug endpoint](docs/images/Captura%20de%20pantalla%202026-10-26%20a%20la%28s%29%204.53.14%E2%80%AFp.m..png)
+
+The CloudWatch log output revealed the full structure of the proxy event. The event received by the Lambda function has this form:
 
 ```json
 {
@@ -471,119 +485,315 @@ vamos a Watch log para ver como esta llegando el evento que es algo similar a
 }
 ```
 
-Ahora vamos a crear los 3 handlers (uno por metodo)
+The proxy event delivers every element of the HTTP request in a single JSON object. The following table identifies where each piece of information appears:
 
-Para eso necesitamos la dependencia 
+| HTTP element | Location in the proxy event |
+|---|---|
+| HTTP method | `httpMethod` (top-level) and `requestContext.httpMethod` |
+| Path | `path` (the resource path) and `requestContext.path` (includes the stage prefix) |
+| Path parameters | `pathParameters` (a map of declared path variables, or `null` if none) |
+| Query parameters | `queryStringParameters` (a map of query-string pairs, or `null` if none) |
+| Headers | `headers` (a map of all HTTP headers) |
+| Request body | `body` (a JSON-encoded string, or `null` for bodyless requests) |
 
-```xml
-<dependency>
-    <groupId>com.fasterxml.jackson.core</groupId>
-    <artifactId>jackson-databind</artifactId>
-    <version>2.17.0</version>
-</dependency>
-```
+Unlike the non-proxy integration, the handler receives all of this at once. The Java code decides which fields to read and what HTTP response to build.
 
-La nueva arquitectura es
+### The HTTP adapter layer
+
+The application logic in `OrderService` should remain independent of AWS. A thin adapter layer sits between API Gateway and the business logic:
 
 ```text
 API Gateway (proxy)
         │
         ▼
-        Lambda Handler (eci.arem.http.*)   ← capa HTTP, conoce JSON/status codes
+Lambda Handler (eci.arem.http.*)   ← HTTP adapter, knows JSON/status codes
         │
         ▼
-        OrderService (eci.arem)             ← lógica de negocio pura, Java plano
+OrderService (eci.arem)             ← pure business logic, plain Java
 ```
 
-Una vez creado los handlers podemos crear los lambda y recursos en el API
+The handler layer is responsible for extracting parameters from the proxy event, calling `OrderService`, catching exceptions, and building the HTTP response envelope. `OrderService` continues to work with domain concepts such as `Order`, `CreateOrder`, and `List<Order>`.
 
-Los recursos se crean casi igual que como se hizo sin proxy integration, pero esta vez no se crean los Mapping templates,
-ni el integration response ni el method respons. Lo único que se mantiene es 
-el query parameter para get orderd by customer id.
+Because the handlers must serialize Java objects to JSON strings for the response body and deserialize the request body for `POST /orders`, the project now includes Jackson as a runtime dependency:
 
-![Captura de pantalla 2026-10-26 a la(s) 5.41.54 p.m..png](docs/images/Captura%20de%20pantalla%202026-10-26%20a%20la%28s%29%205.41.54%E2%80%AFp.m..png)
+```xml
+<dependency>
+    <groupId>com.fasterxml.jackson.core</groupId>
+    <artifactId>jackson-databind</artifactId>
+    <version>2.22.4</version>
+</dependency>
+```
 
-![Captura de pantalla 2026-10-26 a la(s) 5.43.09 p.m..png](docs/images/Captura%20de%20pantalla%202026-10-26%20a%20la%28s%29%205.43.09%E2%80%AFp.m..png)
+The `maven-shade-plugin`, already present in the POM, bundles Jackson into the deployment JAR so that it is available at Lambda runtime.
 
-![Captura de pantalla 2026-10-26 a la(s) 5.44.18 p.m..png](docs/images/Captura%20de%20pantalla%202026-10-26%20a%20la%28s%29%205.44.18%E2%80%AFp.m..png)
+The updated project structure with the `http` adapter package:
 
-### Tests
-
-#### Create Order
 ```text
-https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev/orders
+orders-api/
+├── pom.xml
+└── src/
+    ├── main/
+    │   └── java/eci/arem/
+    │       ├── Order.java
+    │       ├── OrderService.java
+    │       ├── dto/
+    │       │   ├── CreateOrder.java
+    │       │   └── OrderMapper.java
+    │       ├── exception/
+    │       │   ├── HttpStatusCode.java
+    │       │   ├── OrderErrorCode.java
+    │       │   └── OrderException.java
+    │       └── http/
+    │           ├── CreateOrderHandler.java
+    │           ├── DebugHandler.java
+    │           ├── GetOrderByIdHandler.java
+    │           ├── GetOrdersByCustomerIdHandler.java
+    │           └── HttpResponse.java
+    └── test/
+        └── java/eci/arem/
+            └── OrderServiceTest.java
 ```
 
-```json
-{
-  "product": "MacBook Air",
-  "quantity": 1
+### HttpResponse: building the HTTP response envelope
+
+With proxy integration, every Lambda response must be a JSON object containing `statusCode`, `headers`, and `body`. The `HttpResponse` utility class centralizes the construction of this envelope so that each handler does not repeat the same boilerplate.
+
+Internally, every factory method calls the private `build(int statusCode, String body)` method, which assembles the map that API Gateway expects:
+
+```java
+private static Map<String, Object> build(int statusCode, String body) {
+    Map<String, Object> response = new HashMap<>();
+    response.put("statusCode", statusCode);
+    response.put("headers", Map.of("Content-Type", "application/json"));
+    response.put("body", body);
+    return response;
 }
 ```
 
-![createOrderProxySuccess.png](docs/images/tests/createOrderProxySuccess.png)
-Si vemos los headers vemos que esta el location con el id de la orden creada
+API Gateway reads the `statusCode` field to set the HTTP status line, copies the entries of the `headers` map into the HTTP response headers, and places the `body` string as the response payload. The Lambda runtime serializes this `Map<String, Object>` to JSON automatically, so the handler returns a plain Java map without importing any AWS SDK type.
 
-![location.png](docs/images/tests/location.png)
+A companion `serialize(Object)` method converts any Java object (an `Order`, a `List<Order>`, or an error map) into a JSON string using Jackson's `ObjectMapper`. This is necessary because the `body` field must be a string, not a nested JSON object.
 
-Null
-```json
-{
-  "customerId": "CUST-42",
-  "product": "MacBook Air",
-  "quantity": 1
-}
+`HttpResponse` provides four factory methods:
+
+- **`ok(int statusCode, Object body)`** builds a successful response. It serializes the given Java object to a JSON string, sets the provided status code, and includes a `Content-Type: application/json` header. Used for `200 OK` responses such as retrieving an existing order or listing orders by customer.
+
+- **`created(Object body, String locationPath)`** builds a `201 Created` response. In addition to serializing the body and setting `Content-Type`, it adds a **`Location` header** whose value is the path to the newly created resource. This method exists specifically for the create-order operation:
+
+  ```java
+  public static Map<String, Object> created(Object body, String locationPath) {
+      Map<String, Object> response = new HashMap<>();
+      response.put("statusCode", 201);
+      response.put("headers", Map.of(
+              "Content-Type", "application/json",
+              "Location", locationPath
+      ));
+      response.put("body", serialize(body));
+      return response;
+  }
+  ```
+
+  The `Location` header is an HTTP best practice for resource creation: the client can discover where to retrieve the newly created order without parsing the response body.
+
+- **`fromException(OrderException ex)`** builds an error response from a known application exception. It reads the `OrderErrorCode` from the exception, extracts its associated HTTP status code (via `HttpStatusCode`) and its stable error message, and constructs the standard `{"error":"...","message":"..."}` body. This method is the proxy-integration equivalent of the regex-based error mapping used in the non-proxy approach: the handler catches an `OrderException` and calls `fromException` to produce the correct status code and error body, without API Gateway needing to inspect the Lambda error message.
+
+- **`internalError(String message)`** builds a `500 Internal Server Error` response for unexpected failures that do not map to a known `OrderErrorCode`.
+
+### CreateOrderHandler
+
+`CreateOrderHandler.handle` receives the proxy event, extracts the `body` string, deserializes it into a `CreateOrder` record, and delegates to `OrderService.addOrder`. On success, the handler calls:
+
+```java
+Order created = OrderService.addOrder(request);
+return HttpResponse.created(created, "/orders/" + created.id());
 ```
 
-![proxyCreateNull.png](docs/images/tests/proxyCreateNull.png)
+This returns `201 Created` with the new order as the response body and a `Location` header pointing to the created resource's path, such as `/orders/abc-123`. The `Location` header allows a client to follow the returned path to retrieve the newly created order. In the non-proxy integration, building this header would have required an API Gateway response mapping; with proxy integration, the handler constructs it directly.
 
-Negative
+The handler catches `OrderException` at two levels. If the body is null or blank, it returns `400 BLANK_NULL` immediately. If the `CreateOrder` record's compact constructor rejects the input (a null field, a blank string, or a non-positive quantity), Jackson wraps the `OrderException` in a `ValueInstantiationException` during deserialization. The handler unwraps it and produces the corresponding error response. Unexpected exceptions produce `500 INTERNAL_ERROR`.
 
-```json
-{
-  "customerId": "CUST-42",
-  "product": "MacBook Air",
-  "quantity": -5
-}
-```
+### GetOrderByIdHandler
 
-![createProxyNegative.png](docs/images/tests/createProxyNegative.png)
+`GetOrderByIdHandler.handle` reads the `pathParameters` map from the proxy event and extracts the `id` key. It calls `OrderService.getOrderById(id)`, which throws `OrderException` with `ORDER_NOT_FOUND` if no order matches the identifier, or `BLANK_NULL` if the identifier is null or blank. On success, the handler returns `HttpResponse.ok(200, order)` with the single `Order` serialized as a JSON object.
 
-#### Get Oder By Id
+### GetOrdersByCustomerIdHandler
 
-Not found
+`GetOrdersByCustomerIdHandler.handle` reads the `queryStringParameters` map from the proxy event and extracts the `customerId` key. It calls `OrderService.getOrdersByCustomerId(customerId)`, which throws `OrderException` with `BLANK_NULL` if the identifier is absent or empty. On success, the handler returns `HttpResponse.ok(200, orders)`, where `orders` is a `List<Order>` serialized as a JSON array.
+
+### API Gateway proxy configuration
+
+The API Gateway resources for the proxy integration are created in a similar manner to the non-proxy approach: the same `/orders` resource, the same `/orders/{id}` sub-resource, the same HTTP methods. The key difference is that **Use Lambda Proxy integration** is checked when configuring the integration for each method. With proxy integration enabled:
+
+- No **mapping templates** are needed. The handler reads `pathParameters`, `queryStringParameters`, and `body` directly from the proxy event, so there is no VTL transformation step.
+- No **integration response** entries with regular expressions are needed. The handler catches exceptions and builds the complete error response itself, so API Gateway does not need to inspect the Lambda error message with patterns such as `.*Order not found.*`.
+- No **method response** declarations beyond the default `200` are needed. API Gateway forwards whatever `statusCode` the Lambda function returns (`200`, `201`, `400`, `404`, or `500`) to the client.
+
+The only additional API Gateway configuration retained is the `customerId` query string parameter declaration on the `GET /orders` method, which causes API Gateway to include it in the `queryStringParameters` map.
+
+Each Lambda function's handler is configured using the `<package>.<Class>::<method>` syntax:
+
+| Operation | Lambda handler |
+|---|---|
+| Create an order | `eci.arem.http.CreateOrderHandler::handle` |
+| Retrieve by ID | `eci.arem.http.GetOrderByIdHandler::handle` |
+| Search by customer | `eci.arem.http.GetOrdersByCustomerIdHandler::handle` |
+
+The API Gateway configuration screenshots document the proxy setup:
+
+![Proxy integration for POST /orders](docs/images/Captura%20de%20pantalla%202026-10-26%20a%20la%28s%29%205.41.54%E2%80%AFp.m..png)
+
+![Proxy integration for GET /orders/{id}](docs/images/Captura%20de%20pantalla%202026-10-26%20a%20la%28s%29%205.43.09%E2%80%AFp.m..png)
+
+![Proxy integration for GET /orders with customerId query parameter](docs/images/Captura%20de%20pantalla%202026-10-26%20a%20la%28s%29%205.44.18%E2%80%AFp.m..png)
+
+### Deploy and test the proxy API
+
+The API was deployed to the `dev` stage. The base URL recorded in the repository is:
 
 ```text
-https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev/orders/test
+https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev
 ```
 
-Found
+#### Create an order
 
-```text
-https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev/orders/TEST-ORDER-001
+```bash
+curl -i -X POST "$API_BASE_URL/orders" \
+  -H 'Content-Type: application/json' \
+  -d '{"customerId":"CUST-42","product":"MacBook Air","quantity":1}'
 ```
-![orderIdProxyFound.png](docs/images/tests/orderIdProxyFound.png)
 
-#### Get Order By Customer Id
+A successful creation returns `201 Created` with the order body and a `Location` header:
 
-Bad Request
+![Successful POST returns 201 Created with the created order](docs/images/tests/createOrderProxySuccess.png)
 
-```text
-https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev/orders
+The response headers include `Location` with the path to the newly created order, such as `/orders/<generated-id>`:
+
+![Location header in the 201 Created response](docs/images/tests/location.png)
+
+A request with a missing or null required field returns `400 BLANK_NULL`:
+
+```bash
+curl -i -X POST "$API_BASE_URL/orders" \
+  -H 'Content-Type: application/json' \
+  -d '{"product":"MacBook Air","quantity":1}'
 ```
-![proxCustomerIdNull.png](docs/images/tests/proxCustomerIdNull.png)
-Success
 
-```text
-https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev/orders?customerId=CUST-03
+![Missing required field returns BLANK_NULL](docs/images/tests/proxyCreateNull.png)
+
+A negative quantity returns `400 NEGATIVE_QUANTITY`:
+
+```bash
+curl -i -X POST "$API_BASE_URL/orders" \
+  -H 'Content-Type: application/json' \
+  -d '{"customerId":"CUST-42","product":"MacBook Air","quantity":-5}'
 ```
-![proxCustomerId.png](docs/images/tests/proxCustomerId.png)
+
+![Negative quantity returns NEGATIVE_QUANTITY](docs/images/tests/createProxyNegative.png)
+
+#### Retrieve an order by ID
+
+```bash
+curl -i "$API_BASE_URL/orders/TEST-ORDER-001"
+```
+
+![Existing order returns 200 OK](docs/images/tests/orderIdProxyFound.png)
+
+A missing order returns `404 ORDER_NOT_FOUND`:
+
+```bash
+curl -i "$API_BASE_URL/orders/DOES-NOT-EXIST"
+```
+
+![Missing order returns ORDER_NOT_FOUND](docs/images/tests/proxyIdNotFound.png)
+
+#### Find orders by customer
+
+```bash
+curl -i "$API_BASE_URL/orders?customerId=CUST-03"
+```
+
+![Successful customer query returns matching orders](docs/images/tests/proxCustomerId.png)
+
+A missing or absent `customerId` returns `400 BLANK_NULL`:
+
+```bash
+curl -i "$API_BASE_URL/orders"
+```
+
+![Missing customerId returns BLANK_NULL](docs/images/tests/proxCustomerIdNull.png)
 
 ## Compare the Two Architectures
 
+This project now implements two ways of exposing the same Java order operations through API Gateway.
 
+**Architecture A -- API Gateway transformation (non-proxy)**
 
+```text
+HTTP Request
+        │
+        ▼
+API Gateway
+  - routing
+  - parameter extraction (VTL mapping templates)
+  - integration response (regex-based error selection)
+  - method response (status code declarations)
+        │
+        ▼
+Lambda
+        │
+        ▼
+Java Application (OrderService)
+```
 
+**Architecture B -- Lambda proxy integration**
+
+```text
+HTTP Request
+        │
+        ▼
+API Gateway
+  - routing (pass-through)
+        │
+        ▼
+Lambda HTTP Adapter (eci.arem.http.*)
+  - parameter extraction
+  - HTTP responses (HttpResponse)
+        │
+        ▼
+Java Application (OrderService)
+```
+
+**1. Which approach required more API Gateway configuration?**
+
+Architecture A required significantly more API Gateway configuration. Each route needed a VTL mapping template to transform the HTTP request into the exact JSON value expected by the Java method (for example, `"$input.params('id')"` to produce a JSON string scalar). Each error case required an integration response entry with a Lambda error regular expression (such as `.*Order not found.*`) to select the correct HTTP status code, and corresponding method response declarations for each status code (`200`, `201`, `400`, `404`). Architecture B only requires the integration to be marked as proxy; no mapping templates, integration response entries, or regex-based error mappings are configured in the console.
+
+**2. Which approach required more Java infrastructure code?**
+
+Architecture B required more Java code. The non-proxy approach has no HTTP-handling classes beyond the existing `HttpStatusCode` and `OrderErrorCode` enums. The proxy approach adds the `http` package with four handler classes (`CreateOrderHandler`, `GetOrderByIdHandler`, `GetOrdersByCustomerIdHandler`, `DebugHandler`), the `HttpResponse` utility, and the Jackson runtime dependency. This code is the adapter layer that replaces what API Gateway mapping templates and integration responses did in Architecture A.
+
+**3. Which was easier to test locally?**
+
+Architecture B. The proxy handlers are ordinary Java methods that accept a `Map<String, Object>` and return a `Map<String, Object>`. A developer can construct a mock event map in a JUnit test, call the handler method, and assert the returned status code, headers, and body without deploying to AWS or running a local API Gateway emulator. In Architecture A, the mapping templates and integration response regular expressions exist only in the API Gateway console; they cannot be executed or verified without deploying or using an infrastructure emulator.
+
+**4. Where are HTTP status codes defined in each approach?**
+
+In Architecture A, HTTP status codes are defined in two places: the `HttpStatusCode` enum in Java (used by `OrderErrorCode` to associate an error with a numeric status) and the API Gateway Method Response and Integration Response configuration (which actually selects the status code returned to the client). The status code that reaches the client depends on the API Gateway regex match, not on the Java enum alone. In Architecture B, HTTP status codes are defined entirely in the Java handler layer. `HttpResponse.ok`, `HttpResponse.created`, and `HttpResponse.fromException` set the `statusCode` field in the response map, and API Gateway forwards that value directly to the client without further transformation.
+
+**5. What happens if the API grows from 3 operations to 30?**
+
+In Architecture A, each new operation requires a new API Gateway resource, method configuration, one or more mapping templates, and integration response entries with regex patterns for each error case. This console configuration grows linearly and is difficult to review, version-control, or reproduce. In Architecture B, each new operation requires one new handler class that follows the same pattern: extract parameters from the event, call business logic, return an `HttpResponse`. The code lives in the repository, is reviewed in pull requests, and scales with a consistent structure.
+
+**6. Which approach makes the Java business logic cleaner?**
+
+Both approaches keep `OrderService` free of HTTP concepts: it works with `String`, `CreateOrder`, `Order`, and `List<Order>` in both cases. However, Architecture B makes the separation explicit through the `http` package. All HTTP-aware code (event parsing, status codes, response serialization, the `Location` header) lives in the handler layer, and `OrderService` contains none. In Architecture A, the separation is also present, but the HTTP mapping lives outside the repository in API Gateway console configuration, making it harder to see the full picture in one place.
+
+**7. Which approach would be easier for another developer to understand?**
+
+Architecture B. All behavior is expressed in Java code that a developer can read, navigate, and debug in an IDE. A new developer can trace the flow from the handler method to `OrderService` and back to `HttpResponse` without leaving the codebase. In Architecture A, a developer must understand VTL mapping template syntax, the API Gateway integration response selection algorithm, and the relationship between regex patterns and Lambda error messages. These are configured in the AWS console and do not appear in the repository, so the developer sees the Java classes but not the API Gateway configuration that makes them work as an HTTP API.
+
+**8. Which approach would you choose for a larger system? Why?**
+
+Architecture B (proxy integration). For a larger system, the ability to version-control, unit-test, and code-review the full HTTP contract is more important than reducing the amount of Java code. Mapping templates and regex-based response selection are fragile: a change to an error message in Java can silently break an API Gateway mapping with no compile-time or test-time feedback. Proxy integration moves the HTTP mapping into the same codebase and build pipeline as the business logic. The trade-off is that the Java project now contains HTTP-aware adapter code, but this adapter layer is thin, follows a repeatable pattern, and can be tested without AWS. For teams that adopt infrastructure-as-code tools such as SAM or CDK, proxy integration also simplifies the deployment template, since fewer API Gateway configuration blocks are required.
 
 ## References
 
