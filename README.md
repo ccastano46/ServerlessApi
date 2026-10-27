@@ -795,68 +795,235 @@ Architecture B. All behavior is expressed in Java code that a developer can read
 
 Architecture B (proxy integration). For a larger system, the ability to version-control, unit-test, and code-review the full HTTP contract is more important than reducing the amount of Java code. Mapping templates and regex-based response selection are fragile: a change to an error message in Java can silently break an API Gateway mapping with no compile-time or test-time feedback. Proxy integration moves the HTTP mapping into the same codebase and build pipeline as the business logic. The trade-off is that the Java project now contains HTTP-aware adapter code, but this adapter layer is thin, follows a repeatable pattern, and can be tested without AWS. For teams that adopt infrastructure-as-code tools such as SAM or CDK, proxy integration also simplifies the deployment template, since fewer API Gateway configuration blocks are required.
 
-## Final Challenge - Extend the API
+## Final Challenge: Extend the API
 
-In this section, we are going to add a new operation to the API:
+The API initially supported three operations: create, retrieve by ID, and search by customer. The final challenge adds a fourth:
 
+```text
 DELETE /orders/{id}
+```
 
-For this operation, we will need to add a neew method to `OrderService` and a new handler class.
+A successful deletion returns `204 No Content` with an empty body. Deleting a nonexistent order returns `404 ORDER_NOT_FOUND`, and a null or blank identifier returns `400 BLANK_NULL`. These are the same error responses used by the existing retrieval operations.
 
-For my implementation, I am going to create a new method in the `OrderService` class  that uses
-the method getOrderById(String id) from the OrderService class, that way, it would trhow the same exception if the order
-does not exist or if it was a bad request.
+### Design questions
 
 **1. Which Java classes should change?**
 
-OrderService.java will need a new method to delete an order by ID and the packet http will need a new handler class.
+`OrderService` needs a new `deleteOrder(String id)` method that removes an order from the in-memory list. The `http` package needs a new `DeleteOrderHandler` class to receive the proxy event and delegate to `OrderService`. `HttpResponse` needs a new factory method for the `204 No Content` response, since no existing method produces a bodyless response with that status code.
 
 **2. Do you need a new Lambda function?**
 
-Yes, becasue we need a lambda functio for each method.
+Yes. Each handler method is deployed as a separate Lambda function, so the delete operation requires its own function configured with the handler `eci.arem.http.DeleteOrderHandler::handle`.
 
 **3. Does API Gateway configuration need to change?**
 
-Just need to add a new resource that invoke the lambda function.
+Yes. A `DELETE` method must be added to the existing `/orders/{id}` resource in the proxy API, pointing to the new Lambda function with Lambda proxy integration enabled. No mapping templates or integration responses are needed, as the handler builds the complete HTTP response.
 
 **4. Where should the deletion logic reside?**
 
-In orderService.java.
+In `OrderService`. The service layer owns the in-memory order list, so it is the natural place for the `remove` operation. The handler extracts the identifier from the proxy event and delegates to `OrderService.deleteOrder(id)`.
 
-**5.Where should the decision to return 204 or 404 reside?**
+**5. Where should the decision to return 204 or 404 reside?**
 
-In HttpRespone.java.
+The decision is split between `OrderService` and `HttpResponse`. `OrderService.deleteOrder` reuses `getOrderById` internally: if the order does not exist, `getOrderById` throws `OrderException` with `ORDER_NOT_FOUND`, and the handler catches it and calls `HttpResponse.fromException` to produce the `404` response. If the order exists and is removed, the handler calls `HttpResponse.noContent()` to produce the `204` response. The status-code logic lives in `HttpResponse`; the existence check lives in `OrderService`.
 
 **6. Which tests should be added?**
-A test for the new method.
 
+Unit tests for the new `deleteOrder` method in `OrderService`:
+- Deleting an existing order removes it from the list (verified by a subsequent `getOrderById` throwing `ORDER_NOT_FOUND`).
+- Deleting a nonexistent order throws `ORDER_NOT_FOUND`.
+- Deleting with a `null` identifier throws `BLANK_NULL`.
+- Deleting with a blank identifier throws `BLANK_NULL`.
+- Deleting one order does not affect other orders belonging to the same customer.
 
-Lo que hizo la IA fue además de agregar un nuevo metodo en OrderService, añadio un helper en HttpResponse y creo la clase
-Delete order handler.
+### Implementation
 
-Creamos un nuevo recurso en API Gateway y le asignamos el lambda function que se encarga de eliminar una orden
+#### OrderService.deleteOrder
 
-![Captura de pantalla 2026-10-27 a la(s) 3.56.19 a.m..png](docs/images/Captura%20de%20pantalla%202026-10-27%20a%20la%28s%29%203.56.19%E2%80%AFa.m..png)
+The new method reuses `getOrderById` to validate the identifier and locate the order. If the order exists, it is removed from the list. If not, `getOrderById` throws the appropriate `OrderException` before the removal is attempted:
 
-Lo probamos
+```java
+public static void deleteOrder(String id) {
+    Order order = getOrderById(id);
+    orders.remove(order);
+}
+```
+
+This design avoids duplicating the null-check and not-found logic already present in `getOrderById`. The method returns `void` because a successful deletion has no meaningful return value.
+
+#### HttpResponse.noContent
+
+A new factory method produces the `204 No Content` response envelope. Unlike the other factory methods, it sets an empty body and no `Content-Type` header, since a `204` response should not include a representation:
+
+```java
+public static Map<String, Object> noContent() {
+    Map<String, Object> response = new HashMap<>();
+    response.put("statusCode", 204);
+    response.put("headers", Map.of());
+    response.put("body", "");
+    return response;
+}
+```
+
+`HttpResponse` now provides five factory methods, one for each HTTP response pattern used by the API:
+
+| Factory method | Status code | Use case |
+|---|---|---|
+| `ok(int, Object)` | Any (typically `200`) | Successful retrieval or query |
+| `created(Object, String)` | `201` | Successful creation with `Location` header |
+| `noContent()` | `204` | Successful deletion |
+| `fromException(OrderException)` | Depends on error code | Known application error (`400`, `404`) |
+| `internalError(String)` | `500` | Unexpected failure |
+
+#### DeleteOrderHandler
+
+The handler follows the same pattern as the other proxy handlers: extract the path parameter, delegate to `OrderService`, catch `OrderException`, and return the appropriate `HttpResponse`:
+
+```java
+public class DeleteOrderHandler {
+    public static Map<String, Object> handle(Map<String, Object> event) {
+        try {
+            Map<String, String> pathParameters =
+                    (Map<String, String>) event.get("pathParameters");
+            String id = pathParameters != null ? pathParameters.get("id") : null;
+
+            OrderService.deleteOrder(id);
+            return HttpResponse.noContent();
+
+        } catch (OrderException ex) {
+            return HttpResponse.fromException(ex);
+        } catch (Exception ex) {
+            return HttpResponse.internalError(ex.getMessage());
+        }
+    }
+}
+```
+
+The handler is configured as a Lambda function with the handler string `eci.arem.http.DeleteOrderHandler::handle`.
+
+#### Updated project structure
 
 ```text
-https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev/orders/TEST-ORDER-001
+orders-api/
+├── pom.xml
+└── src/
+    ├── main/
+    │   └── java/eci/arem/
+    │       ├── Order.java
+    │       ├── OrderService.java
+    │       ├── dto/
+    │       │   ├── CreateOrder.java
+    │       │   └── OrderMapper.java
+    │       ├── exception/
+    │       │   ├── HttpStatusCode.java
+    │       │   ├── OrderErrorCode.java
+    │       │   └── OrderException.java
+    │       └── http/
+    │           ├── CreateOrderHandler.java
+    │           ├── DebugHandler.java
+    │           ├── DeleteOrderHandler.java
+    │           ├── GetOrderByIdHandler.java
+    │           ├── GetOrdersByCustomerIdHandler.java
+    │           └── HttpResponse.java
+    └── test/
+        └── java/eci/arem/
+            └── OrderServiceTest.java
 ```
-![successdelete.png](docs/images/tests/successdelete.png)
 
-Inexistente
+#### Updated handler table
+
+The complete set of Lambda functions for the proxy API:
+
+| Operation | HTTP method | Resource | Lambda handler |
+|---|---|---|---|
+| Create an order | `POST` | `/orders` | `eci.arem.http.CreateOrderHandler::handle` |
+| Retrieve by ID | `GET` | `/orders/{id}` | `eci.arem.http.GetOrderByIdHandler::handle` |
+| Search by customer | `GET` | `/orders` | `eci.arem.http.GetOrdersByCustomerIdHandler::handle` |
+| Delete an order | `DELETE` | `/orders/{id}` | `eci.arem.http.DeleteOrderHandler::handle` |
+
+### API Gateway configuration
+
+A `DELETE` method was added to the `/orders/{id}` resource with Lambda proxy integration enabled, pointing to the new Lambda function:
+
+![DELETE method configured with Lambda proxy integration on /orders/{id}](docs/images/Captura%20de%20pantalla%202026-10-27%20a%20la%28s%29%203.56.19%E2%80%AFa.m..png)
+
+### Complete HTTP response summary
+
+The final API uses every status code required by the challenge:
+
+| Request outcome | HTTP response | Body or behavior |
+|---|---:|---|
+| Create an order successfully | `201 Created` | The created `Order` with `Location` header |
+| Retrieve an existing order | `200 OK` | One `Order` object |
+| Search for a customer with orders | `200 OK` | A JSON array of matching orders |
+| Search with no matching orders | `200 OK` | An empty JSON array |
+| Delete an existing order | `204 No Content` | Empty body |
+| Retrieve or delete a missing order | `404 Not Found` | `ORDER_NOT_FOUND` with `Order not found` |
+| Missing or blank identifier/customerId | `400 Bad Request` | `BLANK_NULL` with `Value cannot be null or blank` |
+| Negative quantity on create | `400 Bad Request` | `NEGATIVE_QUANTITY` with `Quantity must be greater than 0` |
+| Unexpected failure | `500 Internal Server Error` | `INTERNAL_ERROR` with the exception message |
+
+### Deploy and test the delete operation
+
+The API was deployed to the `dev` stage at:
 
 ```text
-https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev/orders/TEST
+https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev
 ```
-![DELETNOT.png](docs/images/tests/DELETNOT.png)
+
+```bash
+export API_BASE_URL="https://ar8rnw0qr9.execute-api.us-east-1.amazonaws.com/dev"
+```
+
+Delete the seeded test order:
+
+```bash
+curl -i -X DELETE "$API_BASE_URL/orders/TEST-ORDER-001"
+```
+
+A successful deletion returns `204 No Content` with no response body:
+
+![Successful DELETE returns 204 No Content](docs/images/tests/successdelete.png)
+
+Attempt to delete a nonexistent order:
+
+```bash
+curl -i -X DELETE "$API_BASE_URL/orders/DOES-NOT-EXIST"
+```
+
+The response is `404 ORDER_NOT_FOUND`:
+
+![Deleting a nonexistent order returns ORDER_NOT_FOUND](docs/images/tests/DELETNOT.png)
+
 
 ## Required Architecture Diagram
 
-## Recap de como correr pruebas y empaquetar la app
+![flow.png](docs/images/architecture/flow.png)
 
+The diagram traces a `DELETE /orders/TEST-ORDER-001` request through the five architectural layers. The client sends the HTTP request to **API Gateway**, which is an AWS-managed component that routes the call and forwards the full HTTP context as a proxy event. The **Lambda runtime**, also AWS-managed, deserializes the event and invokes the configured handler method. From this point, execution enters ordinary Java code: **DeleteOrderHandler** (in the `eci.arem.http` adapter package) extracts the path parameter, delegates to **OrderService** (in `eci.arem`), and uses **HttpResponse.noContent()** to build the `204 No Content` response envelope. The response travels back through the same layers until API Gateway delivers it to the client. Every handler in the API follows this same flow: API Gateway and Lambda handle transport, the handler translates between HTTP and domain concepts, and `OrderService` executes the business logic without any knowledge of AWS or HTTP.
 
+## Run the Tests and Package the Final Application
+
+After adding the delete operation, rebuild and test the project:
+
+```bash
+mvn clean test
+```
+you can see the test results in jacoco report in `target/site/jacoco/index.html`
+
+![Captura de pantalla 2026-10-27 a la(s) 4.36.00 a.m..png](docs/images/tests/Captura%20de%20pantalla%202026-10-27%20a%20la%28s%29%204.36.00%E2%80%AFa.m..png)
+
+Package the application for deployment:
+
+```bash
+mvn clean package
+```
+
+Upload the resulting `target/orders-api-1.0-SNAPSHOT.jar` to each Lambda function. The `maven-shade-plugin` bundles Jackson into the JAR, so no additional runtime dependencies need to be configured in Lambda.
+
+## Demonstration
+
+[Video](https://drive.google.com/file/d/1vwVoztwhc8kPuvv-RrR08uXjoYtqBJ3D/view?usp=sharing)
 
 
 ## References
